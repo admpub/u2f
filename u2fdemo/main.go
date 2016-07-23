@@ -1,9 +1,12 @@
 // FIDO U2F Go Library
 // Copyright 2015 The FIDO U2F Go Library Authors. All rights reserved.
+// Use of this source code is governed by the MIT
+// license that can be found in the LICENSE file.
 
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -11,14 +14,20 @@ import (
 	"github.com/tstranex/u2f"
 )
 
-const appID = "http://localhost:3483"
+type authenticateRequest struct {
+	SignRequests []u2f.SignRequest `json:"signRequests"`
+}
+
+const appID = "https://localhost:3483"
 
 var trustedFacets = []string{appID}
 
 // Normally these state variables would be stored in a database.
 // For the purposes of the demo, we just store them in memory.
 var challenge *u2f.Challenge
-var registration *u2f.Registration
+
+var registration []u2f.Registration
+var counter uint32
 
 func registerRequest(w http.ResponseWriter, r *http.Request) {
 	c, err := u2f.NewChallenge(appID, trustedFacets)
@@ -41,22 +50,22 @@ func registerResponse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("registerResponse: %+v", regResp)
-
 	if challenge == nil {
 		http.Error(w, "challenge not found", http.StatusBadRequest)
 		return
 	}
 
-	reg, err := u2f.Register(regResp, *challenge)
+	reg, err := u2f.Register(regResp, *challenge, nil)
 	if err != nil {
 		log.Printf("u2f.Register error: %v", err)
 		http.Error(w, "error verifying response", http.StatusInternalServerError)
 		return
 	}
-	registration = reg
 
-	log.Printf("Registration success: %+v", registration)
+	registration = append(registration, *reg)
+	counter = 0
+
+	log.Printf("Registration success: %+v", reg)
 	w.Write([]byte("success"))
 }
 
@@ -74,8 +83,13 @@ func signRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	challenge = c
 
-	req := c.SignRequest(*registration)
-	log.Printf("signRequest: %+v", req)
+	var req authenticateRequest
+	for _, reg := range registration {
+		sr := c.SignRequest(reg)
+		req.SignRequests = append(req.SignRequests, *sr)
+	}
+
+	log.Printf("authenitcateRequest: %+v", req)
 	json.NewEncoder(w).Encode(req)
 }
 
@@ -97,57 +111,68 @@ func signResponse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newCounter, err := registration.Authenticate(signResp, *challenge)
-	if err != nil {
-		log.Printf("VerifySignResponse error: %v", err)
-		http.Error(w, "error verifying response", http.StatusInternalServerError)
-		return
+	var err error
+	for _, reg := range registration {
+		newCounter, err := reg.Authenticate(signResp, *challenge, counter)
+		if err == nil {
+			log.Printf("newCounter: %d", newCounter)
+			counter = newCounter
+			w.Write([]byte("success"))
+			return
+		}
 	}
-	registration.Counter = newCounter
 
-	w.Write([]byte("success"))
+	log.Printf("VerifySignResponse error: %v", err)
+	http.Error(w, "error verifying response", http.StatusInternalServerError)
 }
 
 const indexHTML = `
 <!DOCTYPE html>
 <html>
   <head>
-    <script type="text/javascript" src="chrome-extension://pfboblefjcgdjicmnffhdgionmgcdmne/u2f-api.js"></script>
+    <script src="//code.jquery.com/jquery-1.11.2.min.js"></script>
+    <script type="text/javascript" src="https://demo.yubico.com/js/u2f-api.js"></script>
+
   </head>
   <body>
     <h1>FIDO U2F Go Library Demo</h1>
 
     <ul>
-      <li><a href="https://chrome.google.com/webstore/detail/fido-u2f-universal-2nd-fa/pfboblefjcgdjicmnffhdgionmgcdmne">Install the Chrome extension</a></li>
       <li><a href="javascript:register();">Register token</a></li>
       <li><a href="javascript:sign();">Authenticate</a></li>
     </ul>
 
-    <script src="//code.jquery.com/jquery-1.11.2.min.js"></script>
     <script>
-      function u2fRegistered(resp) {
-        $.post('/registerResponse', JSON.stringify(resp)).done(function() {
-          alert('Success');
-        });
-      }
 
-      function register() {
-        $.getJSON('/registerRequest').done(function(req) {
-          u2f.register([req], [], u2fRegistered, 100)
-        });
-      }
+  function u2fRegistered(resp) {
+    console.log(resp);
+    $.post('/registerResponse', JSON.stringify(resp)).done(function() {
+      alert('Success');
+    });
+  }
 
-      function u2fSigned(resp) {
-        $.post('/signResponse', JSON.stringify(resp)).done(function() {
-          alert('Success');
-        });
-      }
+  function register() {
+    $.getJSON('/registerRequest').done(function(req) {
+      console.log(req);
+      u2f.register(req.appId, [req], [], u2fRegistered, 60);
+    });
+  }
 
-      function sign() {
-        $.getJSON('/signRequest').done(function(req) {
-          u2f.sign([req], u2fSigned, 10);
-        });
-      }
+  function u2fSigned(resp) {
+    console.log(resp);
+    $.post('/signResponse', JSON.stringify(resp)).done(function() {
+      alert('Success');
+    });
+  }
+
+  function sign() {
+    $.getJSON('/signRequest').done(function(req) {
+      console.log(req);
+      var r = req.signRequests[0];
+      u2f.sign(r.appId, r.challenge, req.signRequests, u2fSigned, 60);
+    });
+  }
+
     </script>
 
   </body>
@@ -164,5 +189,16 @@ func main() {
 	http.HandleFunc("/registerResponse", registerResponse)
 	http.HandleFunc("/signRequest", signRequest)
 	http.HandleFunc("/signResponse", signResponse)
-	log.Fatal(http.ListenAndServe(":3483", nil))
+
+	certs, err := tls.X509KeyPair([]byte(tlsCert), []byte(tlsKey))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Printf("Running on %s", appID)
+
+	var s http.Server
+	s.Addr = ":3483"
+	s.TLSConfig = &tls.Config{Certificates: []tls.Certificate{certs}}
+	log.Fatal(s.ListenAndServeTLS("", ""))
 }

@@ -1,5 +1,7 @@
 // Go FIDO U2F Library
 // Copyright 2015 The Go FIDO U2F Library Authors. All rights reserved.
+// Use of this source code is governed by the MIT
+// license that can be found in the LICENSE file.
 
 package u2f
 
@@ -28,7 +30,7 @@ func TestFull(t *testing.T) {
 		t.Error(err)
 	}
 
-	reg, err := Register(regResp, registerChallenge)
+	reg, err := Register(regResp, registerChallenge, nil)
 	if err != nil {
 		t.Error(err)
 	}
@@ -47,11 +49,16 @@ func TestFull(t *testing.T) {
 		t.Error(err)
 	}
 
-	newCounter, err := reg.Authenticate(signResp, authChallenge)
+	newCounter, err := reg.Authenticate(signResp, authChallenge, 0)
 	if err != nil {
 		t.Error(err)
 	}
 	if newCounter != 6 {
 		t.Errorf("Wrong new counter: %d", newCounter)
+	}
+
+	newCounter, err = reg.Authenticate(signResp, authChallenge, 7)
+	if err == nil {
+		t.Errorf("Expected error due to decreasing counter")
 	}
 }
